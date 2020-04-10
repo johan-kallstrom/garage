@@ -10,13 +10,20 @@ class PPO(VPG):
     Args:
         env_spec (garage.envs.EnvSpec): Environment specification.
         policy (garage.torch.policies.base.Policy): Policy.
-        value_function (garage.np.baselines.Baseline): The value function.
-        optimizer (Union[type, tuple[type, dict]]): Type of optimizer.
-            This can be an optimizer type such as `torch.optim.Adam` or a
-            tuple of type and dictionary, where dictionary contains arguments
-            to initialize the optimizer
+        value_function (garage.torch.value_functions.ValueFunction): The value
+            function.
+        policy_optimizer (Union[type, tuple[type, dict]]): Type of optimizer
+            for policy. This can be an optimizer type such as
+            `torch.optim.Adam` or a tuple of type and dictionary, where
+            dictionary contains arguments to initialize the optimizer.
             e.g. `(torch.optim.Adam, {'lr' = 1e-3})`
         policy_lr (float): Learning rate for policy parameters.
+        vf_optimizer (Union[type, tuple[type, dict]]): Type of optimizer
+            for value function. This can be an optimizer type such as
+            `torch.optim.Adam` or a tuple of type and dictionary, where
+            dictionary contains arguments to initialize the optimizer.
+            e.g. `(torch.optim.Adam, {'lr' = 1e-3})`
+        vf_lr (float): Learning rate for value function parameters.
         max_path_length (int): Maximum length of a single rollout.
         lr_clip_range (float): The limit on the likelihood ratio between
             policies.
@@ -50,8 +57,10 @@ class PPO(VPG):
                  env_spec,
                  policy,
                  value_function,
-                 optimizer=torch.optim.Adam,
+                 policy_optimizer=torch.optim.Adam,
                  policy_lr=3e-4,
+                 vf_optimizer=torch.optim.Adam,
+                 vf_lr=3e-4,
                  max_path_length=500,
                  lr_clip_range=2e-1,
                  num_train_per_epoch=1,
@@ -63,14 +72,16 @@ class PPO(VPG):
                  use_softplus_entropy=False,
                  stop_entropy_gradient=False,
                  entropy_method='no_entropy',
-                 minibatch_size=128,
+                 minibatch_size=100,
                  max_optimization_epochs=10):
 
         super().__init__(env_spec=env_spec,
                          policy=policy,
                          value_function=value_function,
-                         optimizer=optimizer,
+                         policy_optimizer=policy_optimizer,
                          policy_lr=policy_lr,
+                         vf_optimizer=vf_optimizer,
+                         vf_lr=vf_lr,
                          max_path_length=max_path_length,
                          num_train_per_epoch=num_train_per_epoch,
                          discount=discount,
