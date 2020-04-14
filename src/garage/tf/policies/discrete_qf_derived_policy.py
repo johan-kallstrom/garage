@@ -55,6 +55,7 @@ class DiscreteQfDerivedPolicy(Policy):
                 dict since there is no parameterization.
 
         """
+        observation = self._env_spec.observation_space.unflatten(observation)
         q_vals = self._f_qval([observation])
         opt_action = np.argmax(q_vals)
 
@@ -72,6 +73,8 @@ class DiscreteQfDerivedPolicy(Policy):
                 dict since there is no parameterization.
 
         """
+        observations = self._env_spec.observation_space.unflatten_n(
+            observations)
         q_vals = self._f_qval(observations)
         opt_actions = np.argmax(q_vals, axis=1)
 
