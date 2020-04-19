@@ -69,7 +69,10 @@ class SAC(OffPolicyRLAlgorithm):
         optimizer(torch.optim): optimizer to be used for policy/actor,
             q_functions/critics, and temperature/entropy optimizations.
         steps_per_epoch (int): Number of train_once calls per epoch.
-
+        num_evaluation_trajs(int): The number of evaluation trajectories
+            used for computing eval stats at the end of every epoch.
+        eval_env(garage.envs.GarageEnv): environment(s) used for collecting
+            evaluation trajectories. If None, a copy of the train env is used.
     """
 
     def __init__(
@@ -94,6 +97,8 @@ class SAC(OffPolicyRLAlgorithm):
             reward_scale=1.0,
             optimizer=torch.optim.Adam,
             steps_per_epoch=1,
+            num_evaluation_trajs=10,
+            eval_env=None,
     ):
 
         self.policy = policy
@@ -106,6 +111,8 @@ class SAC(OffPolicyRLAlgorithm):
         self._initial_log_entropy = initial_log_entropy
         self._gradient_steps = gradient_steps_per_itr
         self._optimizer = optimizer
+        self._num_evaluation_trajs = num_evaluation_trajs
+        self._eval_env = eval_env
 
         super().__init__(env_spec=env_spec,
                          policy=policy,
@@ -156,6 +163,8 @@ class SAC(OffPolicyRLAlgorithm):
             float: The average return in last epoch cycle.
 
         """
+        if not self._eval_env:
+            self._eval_env = runner.get_env_copy()
         last_return = None
         for _ in runner.step_epochs():
             for _ in range(self.steps_per_epoch):
@@ -178,11 +187,8 @@ class SAC(OffPolicyRLAlgorithm):
                 self.episode_rewards.append(np.mean(path_returns))
                 for _ in range(self._gradient_steps):
                     policy_loss, qf1_loss, qf2_loss = self.train_once()
-            last_return = log_performance(runner.step_itr,
-                                          self._obtain_evaluation_samples(
-                                              runner.get_env_copy(),
-                                              num_trajs=10),
-                                          discount=self.discount)
+            last_return = self._evaluate_policy(runner.step_itr,
+                                                self._eval_env)
             self._log_statistics(policy_loss, qf1_loss, qf2_loss)
             tabular.record('TotalEnvSteps', runner.total_env_steps)
             runner.step_itr += 1
@@ -231,24 +237,31 @@ class SAC(OffPolicyRLAlgorithm):
         log_alpha = self.log_alpha
         return log_alpha
 
-    def _temperature_objective(self, log_pi):
+    def _temperature_objective(self, log_pi, get_log_alpha_kwargs=None):
         """Compute the temperature/alpha coefficient loss.
 
         Args:
             log_pi(torch.Tensor): log probability of actions that are sampled
                 from the replay buffer. Shape is (1, buffer_batch_size).
-
+            get_log_alpha_kwargs(dict): keyword args that can be used in
+                retrieving the log_alpha parameter.
         Returns:
             torch.Tensor: the temperature/alpha coefficient loss.
 
         """
+        if not get_log_alpha_kwargs:
+            get_log_alpha_kwargs = {}
         alpha_loss = 0
         if self.use_automatic_entropy_tuning:
-            alpha_loss = (-(self._get_log_alpha()) *
+            alpha_loss = (-(self._get_log_alpha(**get_log_alpha_kwargs)) *
                           (log_pi.detach() + self.target_entropy)).mean()
         return alpha_loss
 
-    def _actor_objective(self, obs, new_actions, log_pi_new_actions):
+    def _actor_objective(self,
+                         obs,
+                         new_actions,
+                         log_pi_new_actions,
+                         get_log_alpha_kwargs=None):
         """Compute the Policy/Actor loss.
 
         Args:
@@ -260,25 +273,30 @@ class SAC(OffPolicyRLAlgorithm):
             log_pi_new_actions(torch.Tensor): Log probability of the new
                 actions on the TanhNormal distributions that they were sampled
                 from. Shape is (1, buffer_batch_size).
+            get_log_alpha_kwargs(dict): keyword args that can be used in
+                retrieving the log_alpha parameter.
 
         Returns:
             torch.Tensor: loss from the Policy/Actor.
 
         """
+        if not get_log_alpha_kwargs:
+            get_log_alpha_kwargs = {}
         with torch.no_grad():
-            alpha = self._get_log_alpha().exp()
+            alpha = self._get_log_alpha(**get_log_alpha_kwargs).exp()
         min_q_new_actions = torch.min(self.qf1(obs, new_actions),
                                       self.qf2(obs, new_actions))
         policy_objective = ((alpha * log_pi_new_actions) -
                             min_q_new_actions.flatten()).mean()
         return policy_objective
 
-    def _critic_objective(self, samples):
+    def _critic_objective(self, samples, get_log_alpha_kwargs=None):
         """Compute the Q-function/critic loss.
 
         Args:
             samples(dict): Transitions that are sampled from the replay buffer.
-
+            get_log_alpha_kwargs(dict): keyword args that can be used in
+                retrieving the log_alpha parameter.
         Returns:
             torch.Tensor: loss from 1st q-function after optimization.
             torch.Tensor: loss from 2nd q-function after optimization.
@@ -289,8 +307,10 @@ class SAC(OffPolicyRLAlgorithm):
         rewards = samples['reward']
         terminals = samples['terminal']
         next_obs = samples['next_observation']
+        if not get_log_alpha_kwargs:
+            get_log_alpha_kwargs = {}
         with torch.no_grad():
-            alpha = self._get_log_alpha().exp()
+            alpha = self._get_log_alpha(**get_log_alpha_kwargs).exp()
 
         q1_pred = self.qf1(obs, actions)
         q2_pred = self.qf2(obs, actions)
@@ -367,6 +387,27 @@ class SAC(OffPolicyRLAlgorithm):
 
         return policy_loss, qf1_loss, qf2_loss
 
+    def _evaluate_policy(self, epoch, eval_env):
+        """Evaluate the performance of the policy via deterministic rollouts.
+
+            Statistics such as (average) discounted return and success rate are
+            recorded.
+        Args:
+            epoch(int): The current training epoch.
+            eval_env(garage.envs.GarageEnv): Environment that is used for
+                evaluation of the policy.
+
+        Returns:
+            float: The average return across self._num_evaluation_trajs
+                trajectories
+        """
+        last_return = log_performance(
+            epoch,
+            self._obtain_evaluation_samples(
+                eval_env, num_trajs=self._num_evaluation_trajs),
+            discount=self.discount)
+        return last_return
+
     def _log_statistics(self, policy_loss, qf1_loss, qf2_loss):
         """Record training statistics to dowel such as losses and returns.
 
@@ -377,7 +418,7 @@ class SAC(OffPolicyRLAlgorithm):
 
         """
         with torch.no_grad():
-            tabular.record('alpha', self.log_alpha.exp().item())
+            tabular.record('alpha', self.log_alpha.exp().mean().item())
         tabular.record('policy_loss', policy_loss.item())
         tabular.record('qf_loss/{}'.format('qf1_loss'), float(qf1_loss))
         tabular.record('qf_loss/{}'.format('qf2_loss'), float(qf2_loss))
