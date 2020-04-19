@@ -1,19 +1,18 @@
-"""GaussianMLPMultitaskPolicy."""
+"""GaussianMLPTaskEmbeddingPolicy."""
 import akro
 import numpy as np
 import tensorflow as tf
 
 from garage.tf.models import GaussianMLPModel
-from garage.tf.policies.multitask_policy import StochasticMultitaskPolicy
+from garage.tf.policies.task_embedding_policy import TaskEmbeddingPolicy
 
 
-class GaussianMLPMultitaskPolicy(StochasticMultitaskPolicy):
-    """GaussianMLPMultitaskPolicy.
+class GaussianMLPTaskEmbeddingPolicy(TaskEmbeddingPolicy):
+    """GaussianMLPTaskEmbeddingPolicy.
 
     Args:
         env_spec (garage.envs.env_spec.EnvSpec): Environment specification.
-        embedding (garage.tf.embeddings.Embedding): Embedding network.
-        task_space (akro.Box): Space of the task.
+        encoder (garage.tf.embeddings.StochasticEncoder): Embedding network.
         name (str): Model name, also the variable scope.
         hidden_sizes (list[int]): Output dimension of dense layer(s) for
             the MLP for mean. For example, (32, 32) means the MLP consists
@@ -63,17 +62,17 @@ class GaussianMLPMultitaskPolicy(StochasticMultitaskPolicy):
         layer_normalization (bool): Bool for using layer normalization or not.
 
     """
+
     def __init__(self,
                  env_spec,
-                 embedding,
-                 task_space,
-                 name='GaussianMLPMultitaskPolicy',
+                 encoder,
+                 name='GaussianMLPTaskEmbeddingPolicy',
                  hidden_sizes=(32, 32),
                  hidden_nonlinearity=tf.nn.tanh,
-                 hidden_w_init=tf.glorot_uniform_initializer(),
+                 hidden_w_init=tf.initializers.glorot_uniform(),
                  hidden_b_init=tf.zeros_initializer(),
                  output_nonlinearity=None,
-                 output_w_init=tf.glorot_uniform_initializer(),
+                 output_w_init=tf.initializers.glorot_uniform(),
                  output_b_init=tf.zeros_initializer(),
                  learn_std=True,
                  adaptive_std=False,
@@ -87,7 +86,7 @@ class GaussianMLPMultitaskPolicy(StochasticMultitaskPolicy):
                  std_parameterization='exp',
                  layer_normalization=False):
         assert isinstance(env_spec.action_space, akro.Box)
-        super().__init__(env_spec, embedding, task_space, name)
+        super().__init__(name, env_spec, encoder)
         self.obs_dim = env_spec.observation_space.flat_dim
         self.action_dim = env_spec.action_space.flat_dim
 
@@ -116,88 +115,106 @@ class GaussianMLPMultitaskPolicy(StochasticMultitaskPolicy):
         self._initialize()
 
     def _initialize(self):
-        state_input = tf.compat.v1.placeholder(tf.float32,
-                                               shape=(None, self.obs_dim))
-        task_input = self._embedding.input
+        obs_input = tf.compat.v1.placeholder(tf.float32,
+                                             shape=(None, self.obs_dim))
+        # task_input = self._encoder.input
         latent_input = tf.compat.v1.placeholder(
-            tf.float32, shape=(None, self._embedding.latent_dim))
+            tf.float32, shape=(None, self._encoder.output_dim))
 
         with tf.compat.v1.variable_scope(self.name) as vs:
             self._variable_scope = vs
 
-            with tf.variable_scope('concat_latent_obs'):
-                latent_state_input = tf.concat(
-                    [latent_input, state_input], axis=-1)
-            self.model.build(latent_state_input, name='from_latent')
+            with tf.compat.v1.variable_scope('concat_obs_latent'):
+                obs_latent_input = tf.concat([obs_input, latent_input],
+                                             axis=-1)
+            self.model.build(obs_latent_input, name='from_latent')
 
-            # Connect with embedding network's latent output
-            with tf.variable_scope('concat_embed_obs'):
-                latent_dist_info_sym = self._embedding.dist_info_sym(
-                    task_input, name='dist_info_sym')
-                latent_var = self._embedding.distribution.sample_sym(
-                    latent_dist_info_sym)
+        self._f_dist_obs_latent = tf.compat.v1.get_default_session(
+        ).make_callable([
+            self.model.networks['from_latent'].mean,
+            self.model.networks['from_latent'].log_std
+        ],
+                        feed_list=[obs_input, latent_input])
 
-                embed_state_input = tf.concat(
-                    [latent_var, state_input], axis=-1)
-            self.model.build(embed_state_input, name='default')
-
-        self._f_dist_latent_obs = tf.compat.v1.get_default_session().make_callable(
-            [
-                self.model.networks['from_latent'].mean,
-                self.model.networks['from_latent'].log_std
-            ],
-            feed_list=[latent_input, state_input])
-
-        self._f_dist_task_obs = tf.compat.v1.get_default_session().make_callable(
-            [
-                self.model.networks['default'].mean,
-                self.model.networks['default'].log_std,
-                self._embedding.latent_mean,
-                self._embedding.latent_std_param,
-            ],
-            feed_list=[task_input, state_input])
-
-    def get_action(self, observation):
-        """Get action sampled from the policy.
+    def dist_info_sym_under_task(self,
+                                 obs_var,
+                                 task_var,
+                                 state_info_vars=None,
+                                 name='default'):
+        """Build a symbolic graph of the action distribution given task.
 
         Args:
-            observation (np.ndarray): Observation from the environment.
+            obs_var (tf.Tensor): Symbolic observation input.
+            task_var (tf.Tensor): Symbolic task input.
+            state_info_vars (dict): Extra state information, e.g.
+                previous action.
+            name (str): Name for symbolic graph.
 
         Returns:
-            (np.ndarray): Action sampled from the policy.
+            dict[tf.Tensor]: Outputs of the symbolic graph of
+                action distribution parameters.
 
         """
-        flat_task_obs = self.task_observation_space.flatten(observation)
-        flat_task, flat_obs = self.split_observation(flat_task_obs)
+        with tf.compat.v1.variable_scope(self._variable_scope):
+            latent_dist_info_sym = self._encoder.dist_info_sym(task_var,
+                                                               name=name)
+            latent_var = self._encoder.distribution.sample_sym(
+                latent_dist_info_sym)
+            obs_latent_input = tf.concat([obs_var, latent_var], axis=-1)
+            mean_var, log_std_var, _, _ = self.model.build(obs_latent_input,
+                                                           name=name)
+        return dict(mean=mean_var, log_std=log_std_var)
 
-        (action_mean, action_log_std, latent_mean, latent_log_std) = self._f_dist_task_obs([flat_task], [flat_obs])
-
-        rnd = np.random.normal(size=action_mean.shape)
-        action_sample = rnd * np.exp(action_log_std) + action_mean
-        action_sample = self.action_space.unflatten(action_sample[0])
-        action_mean = self.action_space.unflatten(action_mean[0])
-        action_log_std = self.action_space.unflatten(action_log_std[0])
-
-        mean = self._embedding.latent_space.unflatten(latent_mean[0])
-        log_std = self._embedding.latent_space.unflatten(latent_log_std[0])
-        latent_info = dict(mean=latent_mean, log_std=latent_log_std)
-        return action, dict(mean=action_mean, log_std=action_log_std, latent_info=latent_info)
-
-    def get_action_from_latent(self, latent, observation):
-        """Get action sampled from the latent and observation.
+    def dist_info_sym_under_latent(self,
+                                   obs_var,
+                                   latent_var,
+                                   state_info_vars=None,
+                                   name='from_latent'):
+        """Build a symbolic graph of the action distribution given latent.
 
         Args:
-            latent (np.ndarray): Latent var from the policy.
-            observation (np.ndarray): Observation from the environment.
+            obs_var (tf.Tensor): Symbolic observation input.
+            latent_var (tf.Tensor): Symbolic latent input.
+            state_info_vars (dict): Extra state information, e.g.
+                previous action.
+            name (str): Name for symbolic graph.
 
         Returns:
-            (np.ndarray): Action sampled from the policy.
+            dict[tf.Tensor]: Outputs of the symbolic graph of distribution
+                parameters.
+
+        """
+        with tf.compat.v1.variable_scope(self._variable_scope):
+            obs_latent_input = tf.concat([obs_var, latent_var], axis=-1)
+            mean_var, log_std_var, _, _ = self.model.build(obs_latent_input,
+                                                           name=name)
+        return dict(mean=mean_var, log_std=log_std_var)
+
+    @property
+    def distribution(self):
+        """Policy action distribution.
+
+        Returns:
+            garage.tf.distributions.DiagonalGaussian: Policy distribution.
+
+        """
+        return self.model.networks['from_latent'].dist
+
+    def get_action_under_latent(self, observation, latent):
+        """Sample an action given observation and latent.
+
+        Args:
+            observation (np.ndarray): Observation from the environment.
+            latent (np.ndarray): Latent.
+
+        Returns:
+            np.ndarray: Action sampled from the policy.
 
         """
         flat_obs = self.observation_space.flatten(observation)
         flat_latent = self.latent_space.flatten(latent)
 
-        mean, log_std = self._f_dist_latent_obs([flat_latent], [flat_obs])
+        mean, log_std = self._f_dist_obs_latent([flat_obs], [flat_latent])
         rnd = np.random.normal(size=mean.shape)
         sample = rnd * np.exp(log_std) + mean
         sample = self.action_space.unflatten(sample[0])
@@ -205,109 +222,41 @@ class GaussianMLPMultitaskPolicy(StochasticMultitaskPolicy):
         log_std = self.action_space.unflatten(log_std[0])
         return sample, dict(mean=mean, log_std=log_std)
 
-    def dist_info_sym(self, task_var, obs_var, state_info_vars=None, name='default'):
-        """Build a symbolic graph of the distribution parameters.
+    def get_actions_under_latents(self, observations, latents):
+        """Sample a batch of actions given observations and latents.
 
         Args:
-            task_var (tf.Tensor): Tensor input for symbolic graph.
-            obs_var (tf.Tensor): Tensor input for symbolic graph.
-            state_info_vars (dict): Extra state information, e.g.
-                previous action.
-            name (str): Name for symbolic graph.
+            observations (np.ndarray): Observations from the environment.
+            latents (np.ndarray): Latents.
 
         Returns:
-            dict[tf.Tensor]: Outputs of the symbolic graph of distribution
-                parameters.
+            np.ndarray: Actions sampled from the policy.
 
         """
-        with tf.compat.v1.variable_scope(self._variable_scope):
-            latent_dist_info_sym = self._embedding.dist_info_sym(
-                task_var, name=name)
-            latent = self._embedding.distribution.sample_sym(
-                latent_dist_info_sym)
-            embed_state_input = tf.concat(
-                [latent, obs_var], axis=-1)
-            mean_var, log_std_var, _, _ = self.model.build(embed_state_input, name=name)
-        return dict(mean=mean_var, log_std=log_std_var)
+        raise NotImplementedError
 
-    def dist_info_sym_from_latent(self, latent_var, obs_var, state_info_vars=None,
-                                  name='from_latent'):
-        """Build a symbolic graph of the distribution parameters from latent.
-
-        Args:
-            latent_var (tf.Tensor): Tensor input for symbolic graph.
-            obs_var (tf.Tensor): Tensor input for symbolic graph.
-            state_info_vars (dict): Extra state information, e.g.
-                previous action.
-            name (str): Name for symbolic graph.
-
-        Returns:
-            dict[tf.Tensor]: Outputs of the symbolic graph of distribution
-                parameters.
-
-        """
-        with tf.compat.v1.variable_scope(self._variable_scope):
-            embed_state_input = tf.concat([latent_var, obs_var], axis=-1)
-            mean_var, log_std_var, _, _ = self.model.build(embed_state_input, name=name)
-        return dict(mean=mean_var, log_std=log_std_var)
-
-    @property
-    def distribution(self):
-        """Policy distribution.
-
-        Returns:
-            garage.tf.distributions.DiagonalGaussian: Policy distribution.
-
-        """
-        return self.model.networks['default'].dist
-
-    def get_action_from_onehot(self, observation, onehot):
-        """Get action sampled from the policy based on onehot index.
+    def get_action_under_task(self, observation, task_id):
+        """Sample an action given observation and task id.
 
         Args:
             observation (np.ndarray): Observation from the environment.
-            onehot (np.ndarray): One hot task index.
+            task_id (np.ndarry): One-hot task id.
 
         Returns:
-            (np.ndarray): Action sampled from the policy.
+            np.ndarray: Action sampled from the policy.
 
         """
         raise NotImplementedError
 
-    def get_actions_from_onehots(self, observations, onehots):
-        """Get actions sampled from the policy based on onehot indices.
+    def get_actions_under_tasks(self, observations, task_ids):
+        """Sample a batch of actions given observations and task ids.
 
         Args:
             observations (np.ndarray): Observations from the environment.
-            onehots (np.ndarray): One hot task indices.
+            task_ids (np.ndarry): One-hot task ids.
 
         Returns:
-            (np.ndarray): Action sampled from the policy.
-
-        """
-        raise NotImplementedError
-
-    def get_actions_from_latents(self, observations, latents):
-        """Get actions sampled from the policy.
-
-        Args:
-            observations (np.ndarray): Observations from the environment.
-            latents (np.ndarray): Latent.
-
-        Returns:
-            (np.ndarray): Actions sampled from the policy.
-
-        """
-        raise NotImplementedError
-
-    def get_actions(self, observations):
-        """Get action sampled from the policy.
-
-        Args:
-            observations (list[np.ndarray]): Observations from the environment.
-
-        Returns:
-            (np.ndarray): Actions sampled from the policy.
+            np.ndarray: Actions sampled from the policy.
 
         """
         raise NotImplementedError
@@ -320,8 +269,7 @@ class GaussianMLPMultitaskPolicy(StochasticMultitaskPolicy):
 
         """
         new_dict = super().__getstate__()
-        del new_dict['_f_dist_latent_obs']
-        del new_dict['_f_dist_task_obs']
+        del new_dict['_f_dist_obs_latent']
         return new_dict
 
     def __setstate__(self, state):
@@ -333,4 +281,3 @@ class GaussianMLPMultitaskPolicy(StochasticMultitaskPolicy):
         """
         super().__setstate__(state)
         self._initialize()
-
