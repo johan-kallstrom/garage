@@ -87,11 +87,11 @@ class GaussianMLPTaskEmbeddingPolicy(TaskEmbeddingPolicy):
                  layer_normalization=False):
         assert isinstance(env_spec.action_space, akro.Box)
         super().__init__(name, env_spec, encoder)
-        self.obs_dim = env_spec.observation_space.flat_dim
-        self.action_dim = env_spec.action_space.flat_dim
+        self._obs_dim = env_spec.observation_space.flat_dim
+        self._action_dim = env_spec.action_space.flat_dim
 
         self.model = GaussianMLPModel(
-            output_dim=self.action_dim,
+            output_dim=self._action_dim,
             hidden_sizes=hidden_sizes,
             hidden_nonlinearity=hidden_nonlinearity,
             hidden_w_init=hidden_w_init,
@@ -116,7 +116,7 @@ class GaussianMLPTaskEmbeddingPolicy(TaskEmbeddingPolicy):
 
     def _initialize(self):
         obs_input = tf.compat.v1.placeholder(tf.float32,
-                                             shape=(None, self.obs_dim))
+                                             shape=(None, self._obs_dim))
         # task_input = self._encoder.input
         latent_input = tf.compat.v1.placeholder(
             tf.float32, shape=(None, self._encoder.output_dim))
